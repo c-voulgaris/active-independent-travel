@@ -37,3 +37,10 @@ vignettes/*.pdf
 
 # R Environment Variables
 .Renviron
+
+# NHTS data files (too big)
+hhpub.csv
+perpup.csv
+trippub.csv
+vehpub.csv
+nhts.zip
