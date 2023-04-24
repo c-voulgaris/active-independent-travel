@@ -27,7 +27,7 @@ with the likelihood:
     * before deciding whether their child will travel independently, or
     * simultaneously with the decision on independent travel?
     
-We are drafting the paper in Overleaf here: https://www.overleaf.com/read/mpcpfsmqxtyh
+We are drafting the paper in Overleaf here: https://www.overleaf.com/read/hxhgmcxbmpwd
 
 The project GitHub repo (including this RMarkdown file) is here: https://github.com/c-voulgaris/active-independent-travel
 
