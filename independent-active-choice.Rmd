@@ -1,0 +1,1457 @@
+---
+title: "Mode Choice and Independent Travel"
+subtitle: "United States, 2017"
+author: "Carole Voulgaris"
+date: "2023-04-07"
+output: 
+  rmdformats::downcute:
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Overview
+
+This analysis seeks to answer the following questions of trips to school taken
+by children between the ages of 8 and 13 years old:
+
+* What characteristics of trips, individuals, and households are associated 
+with the likelihood: 
+    * that a journey to school will be independent (alone or without 
+    a household adult)?
+    * that a journey to school will be by an active mode (cycling or walking)?
+* Do households select their children's travel mode:
+    * after deciding whether their child will travel independently,
+    * before deciding whether their child will travel independently, or
+    * simultaneously with the decision on independent travel?
+    
+We are drafting the paper in Overleaf here: https://www.overleaf.com/read/mpcpfsmqxtyh
+
+The project GitHub repo (including this RMarkdown file) is here: https://github.com/c-voulgaris/active-independent-travel
+
+## Libraries
+
+This analysis uses the following libraries
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(here)
+library(tidyverse)
+library(mlogit)
+library(downloader)
+library(patchwork)
+library(knitr)
+
+here("code",
+     "mlogit_helpers.R") |>
+  source()
+```
+
+# Data
+
+This analysis uses data from the 2017 National Household Travel Survey. 
+This code will download the data to a local folder if you don't have it already.
+
+```{r download-data, eval=FALSE}
+url <- "https://nhts.ornl.gov/assets/2016/download/csv.zip"
+nhts_zipped <- here("nhts.zip")
+nhts_dir <- here("nhts")
+
+download(url, nhts_zipped, mode="wb") 
+unzip(nhts_zipped, exdir = nhts_dir)
+```
+
+Read the data in and set up unique IDs for each trip and each person.
+
+```{r load-data}
+trips <- here("nhts", "trippub.csv") |>
+  read_csv(show_col_types = FALSE) 
+
+people <- here("nhts", "perpub.csv") |>
+  read_csv(show_col_types = FALSE) |>
+  mutate(person_hh = paste(PERSONID, HOUSEID, sep = "-"))
+
+hhs <- here("nhts", "hhpub.csv") |>
+  read_csv(show_col_types = FALSE) 
+
+```
+
+## Filter to short trips to school
+
+I'll filter the data to only include trips that meet the 
+following criteria:
+
+* Trips that end (but do not begin) at school
+* Trips by children between the ages of 8 and 13
+* Trips that end before 10am
+* The first such trip of the day by any person
+* Trip is shorter than 1.25 miles (2 km)
+
+Also creating a separate dataframe that includes all trips by
+the household of the the trips in the study sample.
+
+If there are unlinked trips (e.g. a trip purpose is to transfer
+to/from another mode), we link them together and assign the whole
+thing the mode of the longest segment.
+
+```{r}
+school_trip_hhs <- trips |>
+  mutate(include_trip = (WHYTO == "08" &
+                           WHYFROM != "08" &
+                         R_AGE > 7 & 
+                         R_AGE < 14 &
+                         as.numeric(ENDTIME) < 1000 &
+                         TRPMILES > 0)) |>
+  group_by(HOUSEID) |>
+  mutate(include_hh = sum(include_trip) > 0) |>
+  filter(include_hh) |>
+    mutate(WHYTO = case_when(WHYTO == "08" ~ "school",
+                           WHYTO == "07" ~ "transfer",
+                           WHYTO == "01" ~ "home",
+                           WHYTO == "02" ~ "wfh",
+                           WHYTO == "03" ~ "work",
+                           WHYTO == "06" ~ "chauffer",
+                           WHYTO == "11" ~ "shopping",
+                           WHYTO == "19" ~ "community",
+                           TRUE ~ WHYTO),
+         WHYFROM = case_when(WHYFROM == "08" ~ "school",
+                           WHYFROM == "07" ~ "transfer",
+                           WHYFROM == "01" ~ "home",
+                           WHYFROM == "02" ~ "wfh",
+                           WHYFROM == "03" ~ "work",
+                           WHYFROM == "06" ~ "chauffer",
+                           WHYFROM == "11" ~ "shopping",
+                           WHYFROM == "19" ~ "community",
+                           TRUE ~ WHYFROM)) |>
+  mutate(mode = case_when(TRPTRANS == "10" ~ "school bus",
+                              TRPTRANS == "03" ~ "car",
+                              TRPTRANS == "04" ~ "car",
+                              TRPTRANS == "05" ~ "car",
+                              TRPTRANS == "06" ~ "car",
+                              TRPTRANS == "01" ~ "walk",
+                              TRPTRANS == "02" ~ "bike",
+                              TRPTRANS == "11" ~ "transit",
+                              TRPTRANS == "12" ~ "transit",
+                              TRPTRANS == "13" ~ "transit",
+                              TRPTRANS == "14" ~ "transit",
+                              TRPTRANS == "15" ~ "transit",
+                              TRPTRANS == "16" ~ "transit",
+                          TRUE ~ TRPTRANS)) |>
+  mutate(TDTRPNUM = ifelse(WHYFROM == "transfer", 
+                           paste0("0", as.numeric(TDTRPNUM) - 1), 
+                           TDTRPNUM)) |>
+  mutate(trip_person_hh = paste(TDTRPNUM, PERSONID, HOUSEID, sep = "-")) |>
+  mutate(person_hh = paste(PERSONID, HOUSEID, sep = "-")) |>
+  group_by(trip_person_hh) |>
+  mutate(longest_seg = TRPMILES == max(TRPMILES)) |>
+  mutate(mode = ifelse(longest_seg, mode, "zz")) |>
+  mutate(NUMONTRP = ifelse(longest_seg, NUMONTRP, -1)) |>
+  mutate(ONTD_P1 = ifelse(longest_seg, as.numeric(ONTD_P1), -1),
+         ONTD_P2 = ifelse(longest_seg, as.numeric(ONTD_P2), -1),
+         ONTD_P3 = ifelse(longest_seg, as.numeric(ONTD_P3), -1),
+         ONTD_P4 = ifelse(longest_seg, as.numeric(ONTD_P4), -1),
+         ONTD_P5 = ifelse(longest_seg, as.numeric(ONTD_P5), -1),
+         ONTD_P6 = ifelse(longest_seg, as.numeric(ONTD_P6), -1),
+         ONTD_P7 = ifelse(longest_seg, as.numeric(ONTD_P7), -1),
+         ONTD_P8 = ifelse(longest_seg, as.numeric(ONTD_P8), -1),
+         ONTD_P9 = ifelse(longest_seg, as.numeric(ONTD_P9), -1),
+         ONTD_P10 = ifelse(longest_seg, as.numeric(ONTD_P10), -1),
+         ONTD_P11 = ifelse(longest_seg, as.numeric(ONTD_P11), -1),
+         ONTD_P12 = ifelse(longest_seg, as.numeric(ONTD_P12), -1),
+         ONTD_P13 = ifelse(longest_seg, as.numeric(ONTD_P13), -1)) |>
+  summarise(person_hh = first(person_hh),
+            HOUSEID = first(HOUSEID),
+            WHYFROM = first(WHYFROM),
+            WHYTO = last(WHYTO),
+            mode = min(mode),
+            NUMONTRP = max(NUMONTRP),
+            R_AGE = first(R_AGE),
+            ENDTIME = last(ENDTIME),
+            include_trip = max(include_trip),
+            ONTD_P1 = max(ONTD_P1),
+            ONTD_P2 = max(ONTD_P2),
+            ONTD_P3 = max(ONTD_P3),
+            ONTD_P4 = max(ONTD_P4),
+            ONTD_P5 = max(ONTD_P5),
+            ONTD_P6 = max(ONTD_P6),
+            ONTD_P7 = max(ONTD_P7),
+            ONTD_P8 = max(ONTD_P8),
+            ONTD_P9 = max(ONTD_P9),
+            ONTD_P10 = max(ONTD_P10),
+            ONTD_P11 = max(ONTD_P11),
+            ONTD_P12 = max(ONTD_P12),
+            ONTD_P13 = max(ONTD_P13),
+            HHVEHCNT = first(HHVEHCNT),
+            DRVRCNT = first(DRVRCNT),
+            HHFAMINC = first(HHFAMINC),
+            R_SEX_IMP = first(R_SEX_IMP),
+            TRPMILES = sum(TRPMILES),
+            DBPPOPDN = last(DBPPOPDN),
+            OBPPOPDN = first(OBPPOPDN)) |>
+group_by(person_hh) |>
+  mutate(can_drive = DRVRCNT > 0 & HHVEHCNT > 0,
+         can_sch_bus = sum(mode == "school bus") > 0) |>
+  ungroup() |>
+  filter(TRPMILES < 1.25)
+
+school_trips <- school_trip_hhs |>
+  filter(include_trip > 0) |>
+  filter(!duplicated(person_hh))
+
+sample <- tibble(Type = c("Number of trips",
+                "Number of children",
+                "Number of households"),
+       `Sample size` = c(length(unique(school_trips$trip_person_hh)),
+                         length(unique(school_trips$person_hh)),
+                         length(unique(school_trips$HOUSEID))))
+
+kable(sample)
+```
+
+
+## Dependent variables: Trip mode and independence
+
+Tabulate trips by mode:
+
+```{r mode}
+school_trips |>
+  group_by(mode) |>
+  summarise(`Trips in sample` = n()) |>
+  kable()
+```
+
+Remove transit, motorcycle, and "other" trips. Each of the remaining modes (car, school bus,
+bike, walk) has at least 100 trips in the sample.
+
+```{r}
+school_trips <- school_trips |>
+  filter(mode != "transit" &
+           mode != "08" &
+           mode != "97")
+
+sample <- tibble(Type = c("Number of trips",
+                "Number of children",
+                "Number of households"),
+       `Sample size` = c(length(unique(school_trips$trip_person_hh)),
+                         length(unique(school_trips$person_hh)),
+                         length(unique(school_trips$HOUSEID))))
+
+kable(sample)
+```
+
+We'll create a trip-level variable indicating the independence
+of each trip:
+
+* `alone`: The child was unaccompanied
+* `hh_adlt`: The child traveled with a household adult
+* `others`: The child was accompanied by a person other than a
+household adult, which might be:
+    * Household children
+    * Non-household children
+    * Non-household adult(s)
+
+```{r independence, message=FALSE}
+hh_ages <- people %>%
+  select(HOUSEID, PERSONID, R_AGE) %>%
+  pivot_wider(names_from = PERSONID,
+              names_prefix = "age_",
+              values_from = R_AGE)
+
+school_trips <- school_trips |>
+  left_join(hh_ages) %>%
+  mutate(alone = NUMONTRP == 1,
+         with_hh_adult = 
+           (ONTD_P1 == 1 & age_01 > 17) |
+           (ONTD_P2 == 1 & age_02 > 17) |
+           (ONTD_P3 == 1 & age_03 > 17) |
+           (ONTD_P4 == 1 & age_04 > 17) |
+           (ONTD_P5 == 1 & age_05 > 17) |
+           (ONTD_P6 == 1 & age_06 > 17) |
+           (ONTD_P7 == 1 & age_07 > 17) |
+           (ONTD_P8 == 1 & age_08 > 17) |
+           (ONTD_P9 == 1 & age_09 > 17) |
+           (ONTD_P10 == 1 & age_10 > 17) |
+           (ONTD_P11 == 1 & age_11 > 17) |
+           (ONTD_P12 == 1 & age_12 > 17) |
+           (ONTD_P13 == 1 & age_13 > 17)) |>
+  mutate(independence = case_when(mode == "school bus" ~ "school bus",
+                                  with_hh_adult ~ "hh_adlt",
+                                  alone ~ "alone",
+                                  TRUE ~ "others")) |>
+  mutate(independence = fct_infreq(independence)) 
+```
+
+Here is an unweighted cross-tabulation of mode and independence. We're not
+tracking independence for school bus trips because I'm honestly not 
+convinced survey respondents were counting the number of people on the
+trip in any kind of consistent way. 
+
+```{r}
+table(school_trips$mode, school_trips$independence) |>
+  kable()
+```
+
+15 out of 2142 trips (about 0.7 percent) are shown as children between
+8 and 13 driving alone, which is odd since children younger than 14 
+are not legally permitted to operate a motor vehicle in any state in 
+the United States (in six states, 14-year-olds can get a learner's
+permit which allows them to drive with a licensed driver in the 
+car). This is likely a coding error, so we will filter these trips 
+out and create a combined variable to indicate both mode and independence.
+
+```{r comb-mode-independ}
+school_trips <- school_trips |>
+  mutate(mode_ind = paste(mode, independence, sep = "-")) |>
+  mutate(mode_ind = ifelse(substr(mode_ind, 1, 3) == "sch", 
+                           "school-bus", mode_ind)) |>
+  filter(mode_ind != "car-alone")
+
+sample <- tibble(Type = c("Number of trips",
+                "Number of children",
+                "Number of households"),
+       `Sample size` = c(length(unique(school_trips$trip_person_hh)),
+                         length(unique(school_trips$person_hh)),
+                         length(unique(school_trips$HOUSEID))))
+
+kable(sample)
+```
+
+This leaves us with 2127 trips by 2127 children in 1725 households.
+
+```{r}
+school_trips |>
+  group_by(mode_ind) |>
+  summarise(`Trips in sample` = n()) |>
+  kable()
+```
+
+## Independent variables
+
+We'll include the following independent variables in our analysis:
+
+Household characteristics:
+* Number of vehicles per driver
+* Household income
+* Number of household adults
+* Presence of a non-working adult
+
+Person characteristics:
+* Gender
+* Age
+* Presence of a younger sibling
+* Presence of an older sibling
+
+Trip characteristics:
+* Distance
+* Density
+
+### Vehicle Availability
+
+We'll calculate the ratio of vehicles per driver. Households with 
+zero drivers are assigned a value of zero.
+
+```{r}
+school_trips <- school_trips |>
+  mutate(veh_per_driver = ifelse(DRVRCNT > 0, HHVEHCNT/DRVRCNT, 0))
+```
+
+### Household income
+
+Household income is reported in one of 11 income categories. We convert this
+to a continuous variable by assigning households in each category the mid-point
+value of that category. The highest income category is for incomes greater than 
+$200,000 per year. We assign an income of \$250,000 to that category.
+
+31 children in 26 households for which no income is reported are excluded from 
+the analysis.
+
+```{r}
+school_trips <- school_trips |>
+  mutate(income_k = case_when(HHFAMINC == "01" ~ 5,
+                              HHFAMINC == "02" ~ 12.5,
+                              HHFAMINC == "03" ~ 20,
+                              HHFAMINC == "04" ~ 30,
+                              HHFAMINC == "05" ~ 42.5,
+                              HHFAMINC == "06" ~ 62.5,
+                              HHFAMINC == "07" ~ 87.5,
+                              HHFAMINC == "08" ~ 112.5,
+                              HHFAMINC == "09" ~ 137.5,
+                              HHFAMINC == "10" ~ 175,
+                              HHFAMINC == "11" ~ 250,
+                              TRUE ~ -9)) |>
+  filter(income_k > 0)
+
+sample <- tibble(Type = c("Number of trips",
+                "Number of children",
+                "Number of households"),
+       `Sample size` = c(length(unique(school_trips$trip_person_hh)),
+                         length(unique(school_trips$person_hh)),
+                         length(unique(school_trips$HOUSEID))))
+
+kable(sample)
+```
+
+This leaves us with a sample of 2096 trips by 2096 children in 1699
+households.
+
+### Gender
+
+All survey respondents were coded as either male or female. We created 
+a binary variable indicating whether or not the survey respondent
+was coded as female.
+
+```{r}
+school_trips <- school_trips |>
+  mutate(female = R_SEX_IMP == "02") 
+```
+
+### Age
+
+Age is available directly from the survey data.
+
+### Birth order 
+
+We'll create two individual-level variables indicating whether each 
+child has an older sibling and/or a younger sibling.
+
+```{r hh-calcs}
+birth_order <- people |>
+  mutate(adult = R_AGE > 17,
+         kid_age = ifelse(R_AGE < 18, R_AGE, -2),
+         R_AGE = ifelse(R_AGE < 0, 999, R_AGE),
+         non_worker_adlt = R_AGE > 17 & WORKER != "01") |>
+  group_by(HOUSEID) |>
+  mutate(n_adults = sum(adult),
+         num_records = n(),
+         non_work_adlts = sum(non_worker_adlt) > 0) |>
+  mutate(youngest_kid = ifelse(num_records > HHSIZE, 1, min(R_AGE)),
+         oldest_kid = max(kid_age),
+         n_children = HHSIZE - n_adults) |>
+  mutate(has_old_sib = n_children > 1 & R_AGE != oldest_kid,
+         has_lil_sib = n_children > 1 & R_AGE != youngest_kid) |>
+  mutate(person_hh = paste(PERSONID, HOUSEID, sep = "-")) |>
+  ungroup() |>
+  select(person_hh, WORKER, has_lil_sib, has_old_sib, n_adults, non_work_adlts) 
+  
+
+school_trips <- school_trips |>
+  left_join(birth_order)
+```
+
+
+### Distance
+
+Trip distance is available directly from the survey. Trips with missing
+values for distance are excluded (1 trip).
+
+```{r}
+school_trips <- school_trips |>
+  filter(TRPMILES > 0)
+
+sample <- tibble(Type = c("Number of trips",
+                "Number of children",
+                "Number of households"),
+       `Sample size` = c(length(unique(school_trips$trip_person_hh)),
+                         length(unique(school_trips$person_hh)),
+                         length(unique(school_trips$HOUSEID))))
+
+kable(sample)
+```
+This leaves us with 6454 trips by 6454 children in 5056 households.
+
+### Density
+
+We'll create a variable to indicate the population density of the trips' origin
+or destination census block group (whichever is higher).
+
+We'll filter 1 trip with missing density values for both trip ends.
+
+
+```{r density}
+ school_trips <- school_trips |>
+  mutate(max_od_dens = ifelse(DBPPOPDN > OBPPOPDN, DBPPOPDN, OBPPOPDN)) |>
+  filter(max_od_dens > 0)
+
+sample <- tibble(Type = c("Number of trips",
+                "Number of children",
+                "Number of households"),
+       `Sample size` = c(length(unique(school_trips$trip_person_hh)),
+                         length(unique(school_trips$person_hh)),
+                         length(unique(school_trips$HOUSEID))))
+
+kable(sample)
+```
+
+This leaves us with a sample of 1896 trips by 1896 children in 1,554
+households.
+
+
+## Mode availability
+
+We do not have information on which modes were available for each trip. 
+
+We will assume that:
+
+* Walking and biking are always available (this overestimates the 
+availability of cycling, since not all households own a child-sized bike 
+and not all children know how to ride a bike).
+* Driving with a household adult is an option the household has at least
+one vehicle and at least one driver.
+* Driving with others (e.g. a non-household adult) is always available
+* School bus service is available for the journey to school if the child used for
+the the journey to or from school on the survey day.
+
+```{r define-options, message=FALSE}
+mode_avail <- tibble(mode = c("drive-hh-adlt", 
+                              "drive-others",
+                              "bike",
+                              "walk",
+                              "school-bus"),
+                     share_used = c((sum(school_trips$mode_ind == 
+                                          "car-hh_adlt") / nrow(school_trips)),
+                                    (sum(school_trips$mode_ind == 
+                                          "car-others") / nrow(school_trips)),
+                                    (sum(school_trips$mode == "bike") / nrow(school_trips)),
+                                    (sum(school_trips$mode == "walk") / nrow(school_trips)),
+                                    (sum(school_trips$mode == 
+                                           "school bus") / nrow(school_trips))),
+                     share_avail = c(sum(school_trips$can_drive) / nrow(school_trips),
+                                     1, 1, 1,
+                                     sum(school_trips$can_sch_bus) / nrow(school_trips)))
+
+kable(mode_avail)
+```
+
+Remove those eligible for school bus service from the sample (it's too complicated 
+to include them).
+
+```{r}
+school_trips <- school_trips |>
+  filter(!can_sch_bus)
+
+sample <- tibble(Type = c("Number of trips",
+                "Number of children",
+                "Number of households"),
+       `Sample size` = c(length(unique(school_trips$trip_person_hh)),
+                         length(unique(school_trips$person_hh)),
+                         length(unique(school_trips$HOUSEID))))
+
+kable(sample)
+```
+
+```{r}
+table(school_trips$mode, school_trips$independence) |>
+  kable()
+```
+
+
+# Summary statistics
+
+```{r}
+tibble(var = c("income_k",
+               "veh_per_driver",
+               "n_adults",
+               "is_non_work_adlt",
+               "Age",
+               "female",
+               "lil_sib",
+               "big_sib",
+               "distance",
+               "density"),
+       mean = c(mean(school_trips$income_k),
+                mean(school_trips$veh_per_driver, na.rm = TRUE),
+                mean(school_trips$n_adults),
+                mean(school_trips$non_work_adlts),
+                mean(school_trips$R_AGE),
+                mean(school_trips$female),
+                mean(school_trips$has_lil_sib),
+                mean(school_trips$has_old_sib),
+                mean(school_trips$TRPMILES),
+                mean(school_trips$max_od_dens)),
+       sd = c(sd(school_trips$income_k),
+                sd(school_trips$veh_per_driver, na.rm = TRUE),
+                sd(school_trips$n_adults),
+                999,
+                sd(school_trips$R_AGE),
+                999,
+                999,
+                999,
+                sd(school_trips$TRPMILES),
+                sd(school_trips$max_od_dens))) |>
+  kable()
+
+```
+
+# Models
+
+## Create dfidx dataframe
+
+To run the mlogit function, we need to put our data into a dfidx 
+structure, with a row for each alternative in each choice situation.
+
+Now I'll create one dataset 
+that defines each mode as a separate alternative, one that defines each 
+independence category as a separate alternative, and a third that defines 
+each combination of mode and independence as a separate category.
+  
+```{r}
+mode_dfidx <- fn_make_dfidx(school_trips,
+                                   "trip_person_hh",
+                                   "mode") 
+
+ind_dfidx <- fn_make_dfidx(school_trips,
+                                   "trip_person_hh",
+                                   "independence") 
+
+mode_ind_dfidx <- fn_make_dfidx(school_trips,
+                                   "trip_person_hh",
+                                   "mode_ind") |>
+  filter(avail_choice != "car-others" | can_drive) 
+```
+
+
+
+## Choice of mode
+
+First will predict choice of mode.
+
+```{r}
+model_mode <- mlogit(choice ~ 0 | 
+                      log(income_k) +
+                      veh_per_driver +
+                      n_adults +
+                      non_work_adlts +
+                      R_AGE +
+                      female +
+                      has_lil_sib +
+                      has_old_sib +
+                      log(TRPMILES) +
+                      log(max_od_dens) | 0,
+                           mode_dfidx,
+                           reflevel = "car")
+
+summary(model_mode)
+```
+
+Create data that varies one significance variable at a time.
+
+```{r}
+vary_inc_preds_mode <- fn_predictions(my_model = model_mode,
+                                  to_vary = "income_k",
+                                  max_sample = 2000) |>
+  mutate(alternative = fct_relevel(alternative, 
+                                   "car",
+                                   "bike",
+                                   "walk"))
+
+vary_veh_preds_mode <- fn_predictions(my_model = model_mode,
+                                  to_vary = "veh_per_driver",
+                                  max_sample = 2000) |>
+  mutate(alternative = fct_relevel(alternative, 
+                                   "car",
+                                   "bike",
+                                   "walk"))
+
+vary_age_preds_mode <- fn_predictions(my_model = model_mode,
+                                  to_vary = "R_AGE",
+                                  max_sample = 2000) |>
+  mutate(alternative = fct_relevel(alternative, 
+                                   "car",
+                                   "bike",
+                                   "walk"))
+
+vary_female_preds_mode <- fn_predictions(my_model = model_mode,
+                                  to_vary = "female",
+                                  max_sample = 2000) |>
+  mutate(alternative = fct_relevel(alternative, 
+                                   "car",
+                                   "bike",
+                                   "walk"))
+
+vary_dist_preds_mode <- fn_predictions(my_model = model_mode,
+                                  to_vary = "TRPMILES",
+                                  max_sample = 2000) |>
+  mutate(alternative = fct_relevel(alternative, 
+                                   "car",
+                                   "bike",
+                                   "walk"))
+
+vary_dens_preds_mode <- fn_predictions(my_model = model_mode,
+                                  to_vary = "max_od_dens",
+                                  max_sample = 2000) |>
+  mutate(alternative = fct_relevel(alternative, 
+                                   "car",
+                                   "bike",
+                                   "walk"))
+```
+
+Make figures.
+
+```{r, warning=FALSE, fig.height=5}
+inc_plot_mode <- ggplot(vary_inc_preds_mode) +
+  geom_area(aes(x = income_k, 
+                y = probability,
+                fill = alternative),
+           alpha = 0.6) +
+  scale_fill_manual(values = c("black",
+                               "darkgray",
+                               "lightgray"),
+                      labels = c("Car",
+                                 "Bike",
+                                 "Walk"),
+                     name = "Mode") +
+  scale_x_continuous(name = "Income\n($1 000 USD)",
+                     breaks = c(100, 200)) +
+  scale_y_continuous(name = "Probability") +
+  theme_minimal()
+
+veh_plot_mode <- ggplot(vary_veh_preds_mode) +
+  geom_area(aes(x = veh_per_driver, 
+                y = probability,
+                fill = alternative),
+           alpha = 0.6) +
+  scale_fill_manual(values = c("black",
+                               "darkgray",
+                               "lightgray"),
+                      labels = c("Car",
+                                 "Bike",
+                                 "Walk"),
+                     name = "Mode") +
+  scale_x_continuous(name = "Vehicles per driver",
+                     limits = c(0, 4),
+                     breaks = seq(0,4,by=1)) +
+  scale_y_continuous(name = "Probability") +
+  theme_minimal()
+
+age_plot_mode <- ggplot(vary_age_preds_mode) +
+  geom_area(aes(x = R_AGE, 
+                y = probability,
+                fill = alternative),
+           alpha = 0.6) +
+  scale_fill_manual(values = c("black",
+                               "darkgray",
+                               "lightgray"),
+                      labels = c("Car",
+                                 "Bike",
+                                 "Walk"),
+                     name = "Mode") +
+  scale_x_continuous(name = "Age") +
+  scale_y_continuous(name = "Probability") +
+  theme_minimal()
+
+female_plot_mode <- ggplot(vary_female_preds_mode) +
+  geom_bar(aes(x = female, 
+                y = probability,
+                fill = alternative),
+           stat = "identity",
+           position = position_stack(),
+           alpha = 0.6) +
+  scale_fill_manual(values = c("black",
+                               "darkgray",
+                               "lightgray"),
+                      labels = c("Car",
+                                 "Bike",
+                                 "Walk"),
+                     name = "Mode") +
+   scale_x_discrete(name = "Gender",
+                      labels = c("Boys",
+                                "Girls")) +
+  scale_y_continuous(name = "Probability") +
+  theme_minimal() 
+
+dist_plot_mode <- ggplot(vary_dist_preds_mode) +
+  geom_area(aes(x = TRPMILES, 
+                y = probability,
+                fill = alternative),
+           alpha = 0.6) +
+  scale_fill_manual(values = c("black",
+                               "darkgray",
+                               "lightgray"),
+                      labels = c("Car",
+                                 "Bike",
+                                 "Walk"),
+                     name = "Mode") +
+  scale_x_continuous(name = "Trip distance (km)",
+                     breaks = seq(0, 2, by=0.5)/1.609,
+                     labels = seq(0, 2, by = 0.5)) +
+  scale_y_continuous(name = "Probability") +
+  theme_minimal()
+
+dens_plot_mode <- ggplot(vary_dens_preds_mode) +
+  geom_area(aes(x = max_od_dens, 
+                y = probability,
+                fill = alternative),
+           alpha = 0.6) +
+  scale_fill_manual(values = c("black",
+                               "darkgray",
+                               "lightgray"),
+                      labels = c("Car",
+                                 "Bike",
+                                 "Walk"),
+                     name = "Mode") +
+  scale_x_continuous(name = "Population density\n(people per square km)",
+                     breaks = c(5000*2.59, 10000*2.59),
+                     labels = c("5 000", "10 000")) +
+  scale_y_continuous(name = "Probability") +
+  theme_minimal()
+
+inc_plot_mode + veh_plot_mode + 
+  age_plot_mode + female_plot_mode +
+  dist_plot_mode + dens_plot_mode + 
+  plot_layout(guides = 'collect')
+
+ggsave(filename = "prob_plots_mode.png", 
+       width = 6.25, height = 4, units = "in", dpi = 300)
+```
+
+
+
+## Choice of independence
+
+Predict choice of independence.
+
+```{r}
+model_ind <- mlogit(choice ~ 0 | 
+                       log(income_k) +
+                       veh_per_driver +
+                       n_adults +
+                       non_work_adlts +
+                       R_AGE +
+                       female +
+                       has_lil_sib +
+                       has_old_sib +
+                       log(TRPMILES) + 
+                       log(max_od_dens) | 0, 
+                           ind_dfidx,
+                           reflevel = "hh_adlt")
+
+summary(model_ind)
+```
+
+Create data that varies one significance variable at a time.
+
+```{r, warning=FALSE}
+vary_non_work_preds_ind <- fn_predictions(my_model = model_ind,
+                                  to_vary = "non_work_adlts",
+                                  max_sample = 2000) |>
+  mutate(alternative = fct_relevel(alternative, 
+                                   "hh_adlt",
+                                   "others",
+                                   "alone"))
+
+vary_age_preds_ind <- fn_predictions(my_model = model_ind,
+                                  to_vary = "R_AGE",
+                                  max_sample = 2000) |>
+  mutate(alternative = fct_relevel(alternative, 
+                                   "hh_adlt",
+                                   "others",
+                                   "alone"))
+
+vary_female_preds_ind <- fn_predictions(my_model = model_ind,
+                                  to_vary = "female",
+                                  max_sample = 2000) |>
+  mutate(alternative = fct_relevel(alternative, 
+                                   "hh_adlt",
+                                   "others",
+                                   "alone"))
+
+vary_lil_sib_preds_ind <- fn_predictions(my_model = model_ind,
+                                  to_vary = "has_lil_sib",
+                                  max_sample = 2000) |>
+  mutate(alternative = fct_relevel(alternative, 
+                                   "hh_adlt",
+                                   "others",
+                                   "alone"))
+
+vary_old_sib_preds_ind <- fn_predictions(my_model = model_ind,
+                                  to_vary = "has_old_sib",
+                                  max_sample = 2000) |>
+  mutate(alternative = fct_relevel(alternative, 
+                                   "hh_adlt",
+                                   "others",
+                                   "alone"))
+
+vary_dist_preds_ind <- fn_predictions(my_model = model_ind,
+                                  to_vary = "TRPMILES",
+                                  max_sample = 2000) |>
+  mutate(alternative = fct_relevel(alternative, 
+                                   "hh_adlt",
+                                   "others",
+                                   "alone"))
+```
+
+Make plots
+
+```{r}
+non_work_plot_ind <- ggplot(vary_non_work_preds_ind) +
+  geom_bar(aes(x = non_work_adlts, 
+                y = probability,
+                fill = alternative),
+           stat = "identity",
+           position = position_stack(),
+           alpha = 0.6) +
+  scale_fill_manual(values = c("#7570B3",
+                               "#D95F02",
+                               "#1B9E77"),
+                      labels = c("With household\nadult",
+                                 "With others",
+                                 "Alone"),
+                     name = "Independence") +
+   scale_x_discrete(name = "Non-working parents",
+                      labels = c("None",
+                                "At least\none")) +
+  scale_y_continuous(name = "Probability") +
+  theme_minimal() 
+
+age_plot_ind <- ggplot(vary_age_preds_ind) +
+  geom_area(aes(x = R_AGE, 
+                y = probability,
+                fill = alternative),
+           alpha = 0.6) +
+  scale_fill_manual(values = c("#7570B3",
+                               "#D95F02",
+                               "#1B9E77"),
+                      labels = c("With household\nadult",
+                                 "With others",
+                                 "Alone"),
+                     name = "Independence") +
+  scale_x_continuous(name = "Age") +
+  scale_y_continuous(name = "Probability") +
+  theme_minimal()
+
+female_plot_ind <- ggplot(vary_female_preds_ind) +
+  geom_bar(aes(x = female, 
+                y = probability,
+                fill = alternative),
+           stat = "identity",
+           position = position_stack(),
+           alpha = 0.6) +
+  scale_fill_manual(values = c("#7570B3",
+                               "#D95F02",
+                               "#1B9E77"),
+                      labels = c("With household\nadult",
+                                 "With others",
+                                 "Alone"),
+                     name = "Independence") +
+   scale_x_discrete(name = "Gender",
+                      labels = c("Boys",
+                                "Girls")) +
+  scale_y_continuous(name = "Probability") +
+  theme_minimal() 
+
+old_sib_plot_ind <- ggplot(vary_old_sib_preds_ind) +
+  geom_bar(aes(x = has_old_sib, 
+                y = probability,
+                fill = alternative),
+           stat = "identity",
+           position = position_stack(),
+           alpha = 0.6) +
+  scale_fill_manual(values = c("#7570B3",
+                               "#D95F02",
+                               "#1B9E77"),
+                      labels = c("With household\nadult",
+                                 "With others",
+                                 "Alone"),
+                     name = "Independence") +
+   scale_x_discrete(name = "Has older sibling",
+                      labels = c("No", "Yes")) +
+  scale_y_continuous(name = "Probability") +
+  theme_minimal() 
+
+lil_sib_plot_ind <- ggplot(vary_lil_sib_preds_ind) +
+  geom_bar(aes(x = has_lil_sib, 
+                y = probability,
+                fill = alternative),
+           stat = "identity",
+           position = position_stack(),
+           alpha = 0.6) +
+  scale_fill_manual(values = c("#7570B3",
+                               "#D95F02",
+                               "#1B9E77"),
+                      labels = c("With household\nadult",
+                                 "With others",
+                                 "Alone"),
+                     name = "Independence") +
+   scale_x_discrete(name = "Has younger sibling",
+                      labels = c("No", "Yes")) +
+  scale_y_continuous(name = "Probability") +
+  theme_minimal()
+
+dist_plot_ind <- ggplot(vary_dist_preds_ind) +
+  geom_area(aes(x = TRPMILES, 
+                y = probability,
+                fill = alternative),
+           alpha = 0.6) +
+  scale_fill_manual(values = c("#7570B3",
+                               "#D95F02",
+                               "#1B9E77"),
+                      labels = c("With household\nadult",
+                                 "With others",
+                                 "Alone"),
+                     name = "Independence") +
+  scale_x_continuous(name = "Trip distance (km)",
+                     breaks = seq(0, 2, by=0.5)/1.609,
+                     labels = seq(0, 2, by = 0.5)) +
+  scale_y_continuous(name = "Probability") +
+  theme_minimal()
+
+non_work_plot_ind + age_plot_ind + 
+  female_plot_ind + old_sib_plot_ind +
+  lil_sib_plot_ind + dist_plot_ind + 
+  plot_layout(guides = 'collect')
+
+ggsave(filename = "prob_plots_ind.png", 
+       width = 6.5, height = 4, units = "in", dpi = 300)
+```
+
+
+## Combined choice of mode and independence
+
+I'll estimate three multinomial logistic regressions:
+
+* One with options nested based on mode
+* One with options nested based on independence
+* One without nests
+
+```{r}
+model_mode_nests <- mlogit(choice ~ 0 | 
+                      log(income_k) +
+                       veh_per_driver +
+                       n_adults +
+                       non_work_adlts +
+                       R_AGE +
+                       female +
+                       has_lil_sib +
+                       has_old_sib +
+                       log(TRPMILES) +
+                       log(max_od_dens) | 0, 
+                           mode_ind_dfidx,
+                           reflevel = "car-hh_adlt",
+                           nests = list(car = c("car-hh_adlt",
+                                                  "car-others"),
+                                        bike = c("bike-others",
+                                                 "bike-hh_adlt",
+                                                 "bike-alone"),
+                                        walk = c("walk-hh_adlt",
+                                                 "walk-alone",
+                                                 "walk-others")))
+
+summary(model_mode_nests)
+```
+
+Note that the logsum coefficient for car is greater than 1.0, so this model is
+not reasonable.
+
+```{r}
+model_ind_nests <- update(model_mode_nests,
+                         nests = list(hh_adlt = c("bike-hh_adlt",
+                                                  "car-hh_adlt",
+                                                  "walk-hh_adlt"),
+                                      others = c("bike-others",
+                                                 "car-others",
+                                                 "walk-others"),
+                                      alone = c("bike-alone",
+                                                "walk-alone")))
+
+summary(model_ind_nests)
+```
+
+All logsum coefficients are between 0 and 1.
+
+
+```{r}
+model_no_nests <- update(model_mode_nests,
+                         nests = NULL)
+```
+
+Likelihood ratio test comparing model with independence-based nests
+to the one without nests:
+
+```{r}
+lrtest(model_no_nests, model_ind_nests)
+```
+
+
+# Predictions
+
+Apply the model coefficients to make estimates for varying one
+variable at a time.
+
+```{r, message=FALSE}
+vary_dist_preds <- fn_predictions(my_model = model_ind_nests,
+                                  to_vary = "TRPMILES",
+                                  max_sample = 2000) |>
+  mutate(alternative = fct_relevel(alternative, 
+                                   "car-hh_adlt",
+                                   "bike-hh_adlt",
+                                   "walk-hh_adlt",
+                                   "car-others",
+                                   "bike-others",
+                                   "walk-others",
+                                   "bike-alone",
+                                   "walk-alone"))
+
+vary_inc_preds <- fn_predictions(my_model = model_ind_nests,
+                                  to_vary = "income_k",
+                                  max_sample = 2000) |>
+  mutate(alternative = fct_relevel(alternative, 
+                                   "car-hh_adlt",
+                                   "bike-hh_adlt",
+                                   "walk-hh_adlt",
+                                   "car-others",
+                                   "bike-others",
+                                   "walk-others",
+                                   "bike-alone",
+                                   "walk-alone"))
+
+vary_veh_preds <- fn_predictions(my_model = model_ind_nests,
+                                  to_vary = "veh_per_driver",
+                                  max_sample = 2000) |>
+  mutate(alternative = fct_relevel(alternative, 
+                                   "car-hh_adlt",
+                                   "bike-hh_adlt",
+                                   "walk-hh_adlt",
+                                   "car-others",
+                                   "bike-others",
+                                   "walk-others",
+                                   "bike-alone",
+                                   "walk-alone"))
+
+vary_adlt_preds <- fn_predictions(my_model = model_ind_nests,
+                                  to_vary = "n_adults",
+                                  max_sample = 2000) |>
+  mutate(alternative = fct_relevel(alternative, 
+                                   "car-hh_adlt",
+                                   "bike-hh_adlt",
+                                   "walk-hh_adlt",
+                                   "car-others",
+                                   "bike-others",
+                                   "walk-others",
+                                   "bike-alone",
+                                   "walk-alone"))
+
+vary_age_preds <- fn_predictions(my_model = model_ind_nests,
+                                  to_vary = "R_AGE",
+                                  max_sample = 2000) |>
+  mutate(alternative = fct_relevel(alternative, 
+                                   "car-hh_adlt",
+                                   "bike-hh_adlt",
+                                   "walk-hh_adlt",
+                                   "car-others",
+                                   "bike-others",
+                                   "walk-others",
+                                   "bike-alone",
+                                   "walk-alone"))
+
+vary_dens_preds <- fn_predictions(my_model = model_ind_nests,
+                                  to_vary = "max_od_dens",
+                                  max_sample = 2000) |>
+  mutate(alternative = fct_relevel(alternative, 
+                                   "car-hh_adlt",
+                                   "bike-hh_adlt",
+                                   "walk-hh_adlt",
+                                   "car-others",
+                                   "bike-others",
+                                   "walk-others",
+                                   "bike-alone",
+                                   "walk-alone"))
+
+vary_female_preds <- fn_predictions(my_model = model_ind_nests,
+                                  to_vary = "female",
+                                  max_sample = 2000) |>
+  mutate(alternative = fct_relevel(alternative, 
+                                   "car-hh_adlt",
+                                   "bike-hh_adlt",
+                                   "walk-hh_adlt",
+                                   "car-others",
+                                   "bike-others",
+                                   "walk-others",
+                                   "bike-alone",
+                                   "walk-alone"))
+
+vary_non_work_adlt_preds <- fn_predictions(my_model = model_ind_nests,
+                                  to_vary = "non_work_adlts",
+                                  max_sample = 2000) |>
+  mutate(alternative = fct_relevel(alternative, 
+                                   "car-hh_adlt",
+                                   "bike-hh_adlt",
+                                   "walk-hh_adlt",
+                                   "car-others",
+                                   "bike-others",
+                                   "walk-others",
+                                   "bike-alone",
+                                   "walk-alone"))
+
+vary_lil_sib_preds <- fn_predictions(my_model = model_ind_nests,
+                                  to_vary = "has_lil_sib",
+                                  max_sample = 2000) |>
+  mutate(alternative = fct_relevel(alternative, 
+                                   "car-hh_adlt",
+                                   "bike-hh_adlt",
+                                   "walk-hh_adlt",
+                                   "car-others",
+                                   "bike-others",
+                                   "walk-others",
+                                   "bike-alone",
+                                   "walk-alone"))
+
+vary_old_sib_preds <- fn_predictions(my_model = model_ind_nests,
+                                  to_vary = "has_old_sib",
+                                  max_sample = 2000) |>
+  mutate(alternative = fct_relevel(alternative, 
+                                   "car-hh_adlt",
+                                   "bike-hh_adlt",
+                                   "walk-hh_adlt",
+                                   "car-others",
+                                   "bike-others",
+                                   "walk-others",
+                                   "bike-alone",
+                                   "walk-alone"))
+  
+```
+
+Create plots for each variable.
+
+```{r}
+dist_plot <- ggplot(vary_dist_preds) +
+  geom_area(aes(x = TRPMILES, 
+                y = probability,
+                fill = alternative),
+           alpha = 0.6) +
+  scale_fill_manual(values = c("#58539d",
+                               "#7570B3",
+                               "#9491c5",
+                               "#a84900",
+                               "#D95F02",
+                               "#ff770f",
+                               "#1B9E77",
+                               "#22c997"),
+                      labels = c("Car with household\nadult",
+                                 "Bike with household\nadult",
+                                 "Walk with household\nadult",
+                                 "Car with others",
+                                 "Bike with others",
+                                 "Walk with others",
+                                 "Bike alone",
+                                 "Walk alone"),
+                     name = "Mode/Independence") +
+  scale_x_continuous(name = "Trip distance (km)",
+                     breaks = seq(0, 2, by=0.5)/1.609,
+                     labels = seq(0, 2, by = 0.5)) +
+  scale_y_continuous(name = "Probability") +
+  theme_minimal()
+
+age_plot <- ggplot(vary_age_preds) +
+  geom_area(aes(x = R_AGE, 
+                y = probability,
+                fill = alternative),
+           alpha = 0.6) +
+  scale_fill_manual(values = c("#58539d",
+                               "#7570B3",
+                               "#9491c5",
+                               "#a84900",
+                               "#D95F02",
+                               "#ff770f",
+                               "#1B9E77",
+                               "#22c997"),
+                      labels = c("Car with household\nadult",
+                                 "Bike with household\nadult",
+                                 "Walk with household\nadult",
+                                 "Car with others",
+                                 "Bike with others",
+                                 "Walk with others",
+                                 "Bike alone",
+                                 "Walk alone"),
+                     name = "Mode/Independence") +
+  scale_x_continuous(name = "Age") +
+  scale_y_continuous(name = "Probability") +
+  theme_minimal()
+
+dens_plot <- ggplot(vary_dens_preds) +
+  geom_area(aes(x = max_od_dens, 
+                y = probability,
+                fill = alternative),
+           alpha = 0.6) +
+  scale_fill_manual(values = c("#58539d",
+                               "#7570B3",
+                               "#9491c5",
+                               "#a84900",
+                               "#D95F02",
+                               "#ff770f",
+                               "#1B9E77",
+                               "#22c997"),
+                      labels = c("Car with household\nadult",
+                                 "Bike with household\nadult",
+                                 "Walk with household\nadult",
+                                 "Car with others",
+                                 "Bike with others",
+                                 "Walk with others",
+                                 "Bike alone",
+                                 "Walk alone"),
+                     name = "Mode/Independence") +
+  scale_x_continuous(name = "Population density\n(people per square km)",
+                     breaks = c(5000*2.59, 10000*2.59),
+                     labels = c("5 000", "10 000")) +
+  scale_y_continuous(name = "Probability") +
+  theme_minimal()
+
+veh_plot <- ggplot(vary_veh_preds) +
+  geom_area(aes(x = veh_per_driver, 
+                y = probability,
+                fill = alternative),
+           alpha = 0.6) +
+  scale_fill_manual(values = c("#58539d",
+                               "#7570B3",
+                               "#9491c5",
+                               "#a84900",
+                               "#D95F02",
+                               "#ff770f",
+                               "#1B9E77",
+                               "#22c997"),
+                      labels = c("Car with household\nadult",
+                                 "Bike with household\nadult",
+                                 "Walk with household\nadult",
+                                 "Car with others",
+                                 "Bike with others",
+                                 "Walk with others",
+                                 "Bike alone",
+                                 "Walk alone"),
+                     name = "Mode/Independence") +
+  scale_x_continuous(name = "Vehicles per driver",
+                     limits = c(0, 4),
+                     breaks = seq(0,4,by=1)) +
+  scale_y_continuous(name = "Probability") +
+  theme_minimal()
+
+non_work_adlt_plot <- ggplot(vary_non_work_adlt_preds) +
+  geom_bar(aes(x = non_work_adlts, 
+                y = probability,
+                fill = alternative),
+           stat = "identity",
+           position = position_stack(),
+           alpha = 0.6) +
+  scale_fill_manual(values = c("#58539d",
+                               "#7570B3",
+                               "#9491c5",
+                               "#a84900",
+                               "#D95F02",
+                               "#ff770f",
+                               "#1B9E77",
+                               "#22c997"),
+                      labels = c("Car with household\nadult",
+                                 "Bike with household\nadult",
+                                 "Walk with household\nadult",
+                                 "Car with others",
+                                 "Bike with others",
+                                 "Walk with others",
+                                 "Bike alone",
+                                 "Walk alone"),
+                     name = "Mode/Independence") +
+   scale_x_discrete(name = "Non-working parents",
+                      labels = c("None",
+                                "At least one")) +
+  scale_y_continuous(name = "Probability") +
+  theme_minimal() 
+
+female_plot <- ggplot(vary_female_preds) +
+  geom_bar(aes(x = female, 
+                y = probability,
+                fill = alternative),
+           stat = "identity",
+           position = position_stack(),
+           alpha = 0.6) +
+  scale_fill_manual(values = c("#58539d",
+                               "#7570B3",
+                               "#9491c5",
+                               "#a84900",
+                               "#D95F02",
+                               "#ff770f",
+                               "#1B9E77",
+                               "#22c997"),
+                      labels = c("Car with household\nadult",
+                                 "Bike with household\nadult",
+                                 "Walk with household\nadult",
+                                 "Car with others",
+                                 "Bike with others",
+                                 "Walk with others",
+                                 "Bike alone",
+                                 "Walk alone"),
+                     name = "Mode/Independence") +
+   scale_x_discrete(name = "Gender",
+                    labels = c("Boys", "Girls")) +
+  scale_y_continuous(name = "Probability") +
+  theme_minimal() 
+
+lil_sib_plot <- ggplot(vary_lil_sib_preds) +
+  geom_bar(aes(x = has_lil_sib, 
+                y = probability,
+                fill = alternative),
+           stat = "identity",
+           position = position_stack(),
+           alpha = 0.6) +
+  scale_fill_manual(values = c("#58539d",
+                               "#7570B3",
+                               "#9491c5",
+                               "#a84900",
+                               "#D95F02",
+                               "#ff770f",
+                               "#1B9E77",
+                               "#22c997"),
+                      labels = c("Car with household\nadult",
+                                 "Bike with household\nadult",
+                                 "Walk with household\nadult",
+                                 "Car with others",
+                                 "Bike with others",
+                                 "Walk with others",
+                                 "Bike alone",
+                                 "Walk alone"),
+                     name = "Mode/Independence") +
+   scale_x_discrete(name = "Has younger sibling",
+                    labels = c("No", "Yes")) +
+  scale_y_continuous(name = "Probability") +
+  theme_minimal() 
+
+old_sib_plot <- ggplot(vary_old_sib_preds) +
+  geom_bar(aes(x = has_old_sib, 
+                y = probability,
+                fill = alternative),
+           stat = "identity",
+           position = position_stack(),
+           alpha = 0.6) +
+  scale_fill_manual(values = c("#58539d",
+                               "#7570B3",
+                               "#9491c5",
+                               "#a84900",
+                               "#D95F02",
+                               "#ff770f",
+                               "#1B9E77",
+                               "#22c997"),
+                      labels = c("Car with household\nadult",
+                                 "Bike with household\nadult",
+                                 "Walk with household\nadult",
+                                 "Car with others",
+                                 "Bike with others",
+                                 "Walk with others",
+                                 "Bike alone",
+                                 "Walk alone"),
+                     name = "Mode/Independence") +
+   scale_x_discrete(name = "Has older sibling",
+                    labels = c("No", "Yes")) +
+  scale_y_continuous(name = "Probability") +
+  theme_minimal() 
+
+```
+
+Combine plots and save them.
+
+```{r, warning=FALSE, fig.height=8}
+veh_plot + non_work_adlt_plot + age_plot + 
+  female_plot + old_sib_plot + lil_sib_plot +
+  dist_plot + dens_plot + guide_area() + 
+  plot_layout(guides = 'collect')
+
+ggsave(filename = "prob_plots_mode_ind.png", 
+       width = 6.25, height = 8, units = "in", dpi = 300)
+```
+
