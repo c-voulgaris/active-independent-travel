@@ -331,12 +331,14 @@ school_trips |>
 We'll include the following independent variables in our analysis:
 
 Household characteristics:
+
 * Number of vehicles per driver
 * Household income
 * Number of household adults
 * Presence of a non-working adult
 
 Person characteristics:
+
 * Gender
 * Age
 * Presence of a younger sibling
